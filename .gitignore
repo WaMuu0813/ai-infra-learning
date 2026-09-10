@@ -1,3 +1,4 @@
 *.o
-hello
 build/
+__pycache__/
+*.pyc
