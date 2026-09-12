@@ -3,5 +3,3 @@ build/
 __pycache__/
 *.pyc
 .venv/
-test.txt
-test_with.txt

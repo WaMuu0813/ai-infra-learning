@@ -26,6 +26,9 @@ public:
 
 int main()
 {
+    
+    cout << "CMake rebuild test\n";
+    
     vector<shared_ptr<Request>> queue;
 
     // unordered_map<int, shared_ptr<Request>> request_table;
