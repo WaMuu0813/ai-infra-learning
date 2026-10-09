@@ -46,7 +46,7 @@ __global__ void gemm_naive(
     C[row * N + col] = C_val;
 }
 
-constexpr int TILE = 16;
+constexpr int TILE = 32;
 
 __global__ void gemm_tiled(
     const float* A,
@@ -108,13 +108,82 @@ __global__ void gemm_tiled(
     // 注意边界
 }
 
+__global__ void gemm_register_tiled(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K
+) {
+    __shared__ float As[16][16];
+    __shared__ float Bs[16][16];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row0 = blockIdx.y * 16 + ty * 2;
+    int row1 = row0 + 1;
+    int col = blockIdx.x * 16 + tx;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    for (int t = 0; t < (K + 15) / 16; t++) {
+
+        int a_col = t * 16 + tx;
+        int b_row0 = t * 16 + ty * 2;
+        int b_row1 = b_row0 + 1;
+
+        // A Tile：每个线程加载两个元素
+        As[ty * 2][tx] =
+            (row0 < M && a_col < K)
+            ? A[row0 * K + a_col] : 0.0f;
+
+        As[ty * 2 + 1][tx] =
+            (row1 < M && a_col < K)
+            ? A[row1 * K + a_col] : 0.0f;
+
+        // B Tile：每个线程加载两个元素
+        Bs[ty * 2][tx] =
+            (b_row0 < K && col < N)
+            ? B[b_row0 * N + col] : 0.0f;
+
+        Bs[ty * 2 + 1][tx] =
+            (b_row1 < K && col < N)
+            ? B[b_row1 * N + col] : 0.0f;
+
+        __syncthreads();
+
+        // TODO：使用 Shared Memory
+        // 计算 sum0、sum1
+        // 每轮沿 k 遍历 16 个元素
+        for(int k = 0;k < 16;k++){
+            float b = Bs[k][tx];
+            sum0 += As[ty * 2][k] * b;
+            sum1 += As[ty * 2 + 1][k] * b;
+        }
+
+        __syncthreads();
+    }
+
+    // TODO：把 sum0、sum1 写回 C
+    // 注意 row0、row1、col 的边界
+    if(col < N){
+        if(row0 < M)
+            C[row0 * N + col] = sum0;
+        if(row1 < M)
+            C[row1 * N + col] = sum1;
+    }
+}
+
 int main() {
     constexpr int M = 1024;
     constexpr int N = 1024;
     constexpr int K = 1024;
 
     constexpr int WARMUP = 10;
-    constexpr int REPEAT = 100;
+    constexpr int REPEAT = 50;
 
     size_t bytes_A = static_cast<size_t>(M) * K * sizeof(float);
     size_t bytes_B = static_cast<size_t>(K) * N * sizeof(float);
@@ -122,15 +191,22 @@ int main() {
 
     std::vector<float> h_A(static_cast<size_t>(M) * K);
     std::vector<float> h_B(static_cast<size_t>(K) * N);
-    std::vector<float> h_C(static_cast<size_t>(M) * N);
 
-    // 使用简单、可精确验证的输入
-    for (size_t i = 0; i < h_A.size(); i++) {
-        h_A[i] = 1.0f;
+    std::vector<float> h_C_naive(static_cast<size_t>(M) * N);
+    std::vector<float> h_C_tiled(static_cast<size_t>(M) * N);
+    std::vector<float> h_C_register(static_cast<size_t>(M) * N);
+
+    // 非均匀输入，避免全 1 数据掩盖索引错误
+    for (int row = 0; row < M; row++) {
+        for (int k = 0; k < K; k++) {
+            h_A[row * K + k] = static_cast<float>((row + k) % 7) * 0.1f;
+        }
     }
 
-    for (size_t i = 0; i < h_B.size(); i++) {
-        h_B[i] = 1.0f;
+    for (int k = 0; k < K; k++) {
+        for (int col = 0; col < N; col++) {
+            h_B[k * N + col] = static_cast<float>((k + col) % 5) * 0.1f;
+        }
     }
 
     float *d_A = nullptr;
@@ -149,90 +225,165 @@ int main() {
         d_B, h_B.data(), bytes_B, cudaMemcpyHostToDevice
     ));
 
-    dim3 block(16, 16);
+    std::cout << "Matrix: "
+              << M << " x " << K
+              << " * "
+              << K << " x " << N << "\n\n";
 
-    dim3 grid(
-        (N + block.x - 1) / block.x,
-        (M + block.y - 1) / block.y
+    // Benchmark：复用相同的计时逻辑
+    auto benchmark = [&](auto kernel, const char* name,
+                     std::vector<float>& h_C,
+                     dim3 kernel_grid,
+                     dim3 kernel_block) -> float {
+
+        // 预热
+        for (int i = 0; i < WARMUP; i++) {
+            kernel<<<kernel_grid, kernel_block>>>(d_A, d_B, d_C, M, N, K);
+        }
+
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        cudaEvent_t start, stop;
+
+        CHECK_CUDA(cudaEventCreate(&start));
+        CHECK_CUDA(cudaEventCreate(&stop));
+
+        CHECK_CUDA(cudaEventRecord(start));
+
+        for (int i = 0; i < REPEAT; i++) {
+            kernel<<<kernel_grid, kernel_block>>>(d_A, d_B, d_C, M, N, K);
+        }
+
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        CHECK_CUDA(cudaGetLastError());
+
+        float total_ms = 0.0f;
+
+        CHECK_CUDA(cudaEventElapsedTime(
+            &total_ms, start, stop
+        ));
+
+        float avg_ms = total_ms / REPEAT;
+
+        CHECK_CUDA(cudaMemcpy(
+            h_C.data(), d_C, bytes_C, cudaMemcpyDeviceToHost
+        ));
+
+        double flops = 2.0 * M * N * K;
+
+        double gflops =
+            flops / (static_cast<double>(avg_ms) / 1000.0) / 1e9;
+
+        std::cout << name << ":\n";
+        std::cout << "  Average Time: " << avg_ms << " ms\n";
+        std::cout << "  Performance: " << gflops << " GFLOPS\n";
+
+        CHECK_CUDA(cudaEventDestroy(start));
+        CHECK_CUDA(cudaEventDestroy(stop));
+
+        return avg_ms;
+    };
+
+    // Naive GEMM：16×16 线程
+    dim3 naive_block(16, 16);
+    dim3 naive_grid(
+        (N + 15) / 16,
+        (M + 15) / 16
     );
 
-    std::cout << "Matrix A: " << M << " x " << K << '\n';
-    std::cout << "Matrix B: " << K << " x " << N << '\n';
-    std::cout << "Grid: (" << grid.x << ", " << grid.y << ")\n";
-    std::cout << "Block: (" << block.x << ", " << block.y << ")\n";
+    // Shared Memory Tiled GEMM：32×32 线程
+    dim3 tiled_block(TILE, TILE);
+    dim3 tiled_grid(
+        (N + TILE - 1) / TILE,
+        (M + TILE - 1) / TILE
+    );
 
-    // 预热 GPU
-    for (int i = 0; i < WARMUP; i++) {
-        gemm_naive<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-    }
+    // Register Tiling：16×8 线程
+    // 每个 Block 计算 C 的 16×16 区域
+    dim3 register_block(16, 8);
+    dim3 register_grid(
+        (N + 15) / 16,
+        (M + 15) / 16
+    );
 
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    float naive_ms = benchmark(
+        gemm_naive,
+        "Naive GEMM",
+        h_C_naive,
+        naive_grid,
+        naive_block
+    );
 
-    // CUDA Event 计时
-    cudaEvent_t start, stop;
+    float tiled_ms = benchmark(
+        gemm_tiled,
+        "Tiled GEMM",
+        h_C_tiled,
+        tiled_grid,
+        tiled_block
+    );
 
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
+    float register_ms = benchmark(
+        gemm_register_tiled,
+        "Register Tiling GEMM",
+        h_C_register,
+        register_grid,
+        register_block
+    );
 
-    CHECK_CUDA(cudaEventRecord(start));
+    // CPU 参考计算：抽样检查多个输出位置
+    // 避免完整 CPU GEMM 带来较长的等待时间
+    bool naive_pass = true;
+    bool tiled_pass = true;
+    bool register_pass = true;
 
-    for (int i = 0; i < REPEAT; i++) {
-        gemm_naive<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-    }
+    for (int row = 0; row < M; row += 31) {
+        for (int col = 0; col < N; col += 29) {
 
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
-    CHECK_CUDA(cudaGetLastError());
+            double expected = 0.0;
 
-    float total_ms = 0.0f;
+            for (int k = 0; k < K; k++) {
+                expected +=
+                    static_cast<double>(h_A[row * K + k]) *
+                    static_cast<double>(h_B[k * N + col]);
+            }
 
-    CHECK_CUDA(cudaEventElapsedTime(
-        &total_ms, start, stop
-    ));
+            size_t idx = static_cast<size_t>(row) * N + col;
 
-    float avg_ms = total_ms / REPEAT;
+            if (std::fabs(h_C_naive[idx] - expected) > 1e-3) {
+                naive_pass = false;
+            }
 
-    // 拷贝结果回 CPU
-    CHECK_CUDA(cudaMemcpy(
-        h_C.data(), d_C, bytes_C, cudaMemcpyDeviceToHost
-    ));
+            if (std::fabs(h_C_tiled[idx] - expected) > 1e-3) {
+                tiled_pass = false;
+            }
 
-    // 验证结果
-    // A、B 全部为 1，所以 C 的每个元素应当等于 K
-    bool pass = true;
-
-    for (size_t i = 0; i < h_C.size(); i++) {
-        if (std::fabs(h_C[i] - static_cast<float>(K)) > 1e-3f) {
-            std::cerr << "Mismatch at index " << i
-                      << ", expected: " << K
-                      << ", actual: " << h_C[i] << '\n';
-            pass = false;
-            break;
+            if (std::fabs(h_C_register[idx] - expected) > 1e-3) {
+                register_pass = false;
+            }
         }
     }
 
-    double flops =
-        2.0 * static_cast<double>(M) * N * K;
+    std::cout << "\nVerification:\n";
+    std::cout << "  Naive: "
+              << (naive_pass ? "PASS" : "FAIL") << '\n';
 
-    double gflops =
-        flops / (static_cast<double>(avg_ms) / 1000.0) / 1e9;
+    std::cout << "  Tiled: "
+              << (tiled_pass ? "PASS" : "FAIL") << '\n';
 
-    std::cout << "Verification: "
-              << (pass ? "PASS" : "FAIL") << '\n';
+    std::cout << "  Register Tiling: "
+            << (register_pass ? "PASS" : "FAIL") << '\n';
 
-    std::cout << "Average Kernel Time: "
-              << avg_ms << " ms\n";
+    std::cout << "\nSpeedup (Naive / Tiled): "
+              << naive_ms / tiled_ms << "x\n";
 
-    std::cout << "Performance: "
-              << gflops << " GFLOPS\n";
-
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
+    std::cout << "Speedup (Tiled / Register): "
+          << tiled_ms / register_ms << "x\n";
 
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
 
-    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (naive_pass && tiled_pass && register_pass) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
