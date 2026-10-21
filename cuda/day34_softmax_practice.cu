@@ -4,6 +4,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
+#include <random>
 
 #define CHECK_CUDA(call) \
 do { \
@@ -49,6 +51,8 @@ __global__ void softmax_v1(float* input, float* output, int M, int N) {
     }
     smem[tid] = sum;
 
+    __syncthreads();
+
     for(int s = blockDim.x / 2;s > 0;s >>= 1){
         if(tid < s){
             smem[tid] += smem[tid + s];
@@ -57,6 +61,7 @@ __global__ void softmax_v1(float* input, float* output, int M, int N) {
     }
 
     sum = smem[0];
+
     float inv_sum = 1.0f / sum;
 
     for(int i = tid;i < N;i += blockDim.x){
@@ -74,7 +79,7 @@ __device__ float warpReduceMax(float val){
 
 __device__ float warpReduceSum(float val){
     for(int offset = 16;offset > 0;offset >>= 1){
-        val += __shfl_down_sync(0xfffffff,val,offset);
+        val += __shfl_down_sync(0xffffffff,val,offset);
     }
     return val;
 }
@@ -111,7 +116,6 @@ __device__ float blockReduceSumShuffle(float val){
     __syncthreads();
     int num_warps = blockDim.x / 32;
     val = (lane < num_warps) ? warp_sum[lane] : 0.0f;
-    __syncthreads();
     if(wid == 0)
         val = warpReduceSum(val);
     __shared__ float block_sum;
@@ -135,7 +139,7 @@ __global__ void softmax_v2(float* input, float* output, int M, int N){
     float max_val = blockReduceMaxShuffle(local_max);
     float local_sum = 0.0f;
     for(int i = tid;i < N;i += blockDim.x){
-        local_sum = expf(x[i] - max_val);
+        local_sum += expf(x[i] - max_val);
     }
     float sum = blockReduceSumShuffle(local_sum);
     float inv_sum = 1.0f / sum;
@@ -144,13 +148,46 @@ __global__ void softmax_v2(float* input, float* output, int M, int N){
     }
 }   
 
+std::vector<double> softmax_cpu(const std::vector<float>& input,int m,int n){
+    std::vector<double> ans(m * n,0);
+    double tmp_max = -INFINITY;
+    double tmp_sum = 0;
+    for(int i = 0;i < m;i++){
+        tmp_max = -INFINITY;
+        tmp_sum = 0;
+        for(int j = 0;j < n;j++){
+            tmp_max = fmax(tmp_max,input[i * n + j]);
+        }
+        
+        for(int k = 0;k < n;k++){
+            tmp_sum += exp(input[i * n + k] - tmp_max);
+        }
+        for(int v = 0;v < n;v++){
+            ans[i * n + v] = exp(input[i * n + v] - tmp_max) / tmp_sum;
+        }
+    }
+    return ans;
+}
+
 int main(){
     const int M = 128;
-    const int N = 257;
+    const int N = 1024;
     const int THREADS = 256;
+    const int WARM_UP = 100;
+    const int REPEAT = 1000;
     size_t bytes = M * N * sizeof(float);
     std::vector<float> h_input(M * N,0);
     std::vector<float> h_output(M * N,-1);
+
+    std::mt19937 generator(42);
+    std::uniform_real_distribution<float> distribution(-10.0f, 10.0f);
+
+    for (float& value : h_input) {
+        value = distribution(generator);
+    }
+
+    std::vector<double> h_reference(M * N,0);
+    h_reference = softmax_cpu(h_input,M,N);
 
     float* d_input = nullptr;
     float* d_output = nullptr;
@@ -160,36 +197,88 @@ int main(){
     
     CHECK_CUDA(cudaMemcpy(d_input,h_input.data(),bytes,cudaMemcpyHostToDevice));
 
-    softmax_v1<<<M,THREADS,THREADS * sizeof(float)>>>(d_input,d_output,M,N);
+    for(int i = 0;i < WARM_UP;i++){
+        softmax_v1<<<M,THREADS,THREADS * sizeof(float)>>>(d_input,d_output,M,N);
+    }
+    CHECK_CUDA(cudaGetLastError());
 
+    for(int i = 0;i < WARM_UP;i++){
+        softmax_v2<<<M,THREADS>>>(d_input,d_output,M,N);
+    }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    cudaEvent_t start,stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for(int i = 0;i < REPEAT;i++){
+        softmax_v1<<<M,THREADS,THREADS * sizeof(float)>>>(d_input,d_output,M,N);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    float ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms,start,stop));
+    float avg_ms_v1 = ms / REPEAT;
     CHECK_CUDA(cudaMemcpy(h_output.data(),d_output,bytes,cudaMemcpyDeviceToHost));
-    
+
     int unlimited = 0;
-    float target = 1.0 / N;
-    double max = 0;
+    double max_error = 0.0f;
     for(int i = 0;i < M * N;i++){
         if(!std::isfinite(h_output[i])){
             unlimited++;
             continue;
         }
-        if(h_output[i] != target){
-            max = fmax(max,std::abs(h_output[i] - target));
-        }
+
+        max_error = fmax(max_error,std::abs(h_output[i] - h_reference[i]));
     }
 
-    if(unlimited == 0 && max <= 1e-6)
-        std::cout << "PASSED" << std::endl;
+    if(unlimited == 0 && max_error <= 1e-6)
+        std::cout << "V1 PASSED" << std::endl;
     else
-        std::cout << "FAILED" << std::endl;
+        std::cout << "V1 FAILED" << std::endl;
+    std::cout << "V1 Unlimited: " << unlimited << std::endl;
+    std::cout << "V1 Max Error: " << max_error << std::endl;
 
-    std::cout << "Unlimited: " << unlimited << std::endl;
-    std::cout << "Max Error" << max << std::endl;
+    CHECK_CUDA(cudaEventRecord(start));
+    for(int i = 0;i < REPEAT;i++){
+        softmax_v2<<<M,THREADS>>>(d_input,d_output,M,N);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaEventElapsedTime(&ms,start,stop));
+    float avg_ms_v2 = ms / REPEAT;
+    CHECK_CUDA(cudaMemcpy(h_output.data(),d_output,bytes,cudaMemcpyDeviceToHost));
+
+    unlimited = 0;
+    max_error = 0.0f;
+    for(int i = 0;i < M * N;i++){
+        if(!std::isfinite(h_output[i])){
+            unlimited++;
+            continue;
+        }
+
+        max_error = fmax(max_error,std::abs(h_output[i] - h_reference[i]));
+    }
+
+    if(unlimited == 0 && max_error <= 1e-6)
+        std::cout << "V2 PASSED" << std::endl;
+    else
+        std::cout << "V2 FAILED" << std::endl;
+
+    std::cout << "V2 Unlimited: " << unlimited << std::endl;
+    std::cout << "V2 Max Error: " << max_error << std::endl;
+    
+    std::cout << "V1 Average Time: " << avg_ms_v1 << "ms" << std::endl;
+    std::cout << "V2 Average Time: " << avg_ms_v2 << "ms" << std::endl;
 
     CHECK_CUDA(cudaFree(d_input));
     CHECK_CUDA(cudaFree(d_output));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
 
     return 0;
 }
