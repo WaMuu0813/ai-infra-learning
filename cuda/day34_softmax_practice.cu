@@ -5,6 +5,17 @@
 #include <algorithm>
 #include <cstdlib>
 
+#define CHECK_CUDA(call) \
+do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA Error: " \
+                  << cudaGetErrorString(err) \
+                  << std::endl; \
+        exit(1); \
+    } \
+} while (0)
+
 __global__ void softmax_v1(float* input, float* output, int M, int N) {
     extern __shared__ float smem[];
 
@@ -25,12 +36,10 @@ __global__ void softmax_v1(float* input, float* output, int M, int N) {
     for(int s = blockDim.x / 2;s > 0;s >>= 1){
         if(tid < s)
             smem[tid] = fmax(smem[tid],smem[tid + s]);
+        __syncthreads();
     }
-
-    __syncthreads();
     
-    if(tid == 0)
-        max_val = smem[0];
+    max_val = smem[0];
 
     __syncthreads();
 
@@ -40,18 +49,14 @@ __global__ void softmax_v1(float* input, float* output, int M, int N) {
     }
     smem[tid] = sum;
 
-    __syncthreads();
-
     for(int s = blockDim.x / 2;s > 0;s >>= 1){
         if(tid < s){
             smem[tid] += smem[tid + s];
         }
+        __syncthreads();
     }
 
-    __syncthreads();
-
-    if(tid == 0)
-        sum = smem[0];
+    sum = smem[0];
     float inv_sum = 1.0f / sum;
 
     for(int i = tid;i < N;i += blockDim.x){
@@ -138,3 +143,53 @@ __global__ void softmax_v2(float* input, float* output, int M, int N){
         y[i] = expf(x[i] - max_val) * inv_sum;
     }
 }   
+
+int main(){
+    const int M = 128;
+    const int N = 257;
+    const int THREADS = 256;
+    size_t bytes = M * N * sizeof(float);
+    std::vector<float> h_input(M * N,0);
+    std::vector<float> h_output(M * N,-1);
+
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+
+    CHECK_CUDA(cudaMalloc(&d_input,bytes));
+    CHECK_CUDA(cudaMalloc(&d_output,bytes));
+    
+    CHECK_CUDA(cudaMemcpy(d_input,h_input.data(),bytes,cudaMemcpyHostToDevice));
+
+    softmax_v1<<<M,THREADS,THREADS * sizeof(float)>>>(d_input,d_output,M,N);
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemcpy(h_output.data(),d_output,bytes,cudaMemcpyDeviceToHost));
+    
+    int unlimited = 0;
+    float target = 1.0 / N;
+    double max = 0;
+    for(int i = 0;i < M * N;i++){
+        if(!std::isfinite(h_output[i])){
+            unlimited++;
+            continue;
+        }
+        if(h_output[i] != target){
+            max = fmax(max,std::abs(h_output[i] - target));
+        }
+    }
+
+    if(unlimited == 0 && max <= 1e-6)
+        std::cout << "PASSED" << std::endl;
+    else
+        std::cout << "FAILED" << std::endl;
+
+    std::cout << "Unlimited: " << unlimited << std::endl;
+    std::cout << "Max Error" << max << std::endl;
+
+    CHECK_CUDA(cudaFree(d_input));
+    CHECK_CUDA(cudaFree(d_output));
+
+    return 0;
+}
