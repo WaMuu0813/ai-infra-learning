@@ -148,6 +148,42 @@ __global__ void softmax_v2(float* input, float* output, int M, int N){
     }
 }   
 
+template<int ITEMS>
+__global__ void softmax_v3(float* input, float* output, int M, int N){
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float* x = input + row * N;
+    float* y = output + row * N;
+
+    float private_elm[ITEMS];
+
+    float local_max = -INFINITY;
+    #pragma unroll
+    for(int i = 0;i < ITEMS;i++){
+        int idx = tid + i * blockDim.x;
+        private_elm[i] = (idx < N) ? x[idx] : -INFINITY;
+        local_max = fmax(local_max,private_elm[i]);
+    }
+    float max_val = blockReduceMaxShuffle(local_max);
+
+    float local_sum = 0.0f;
+    #pragma unroll
+    for(int i = 0;i < ITEMS;i++){
+        private_elm[i] = expf(private_elm[i] - max_val);
+        local_sum += private_elm[i];
+    }
+    float sum = blockReduceSumShuffle(local_sum);
+    float inv_sum = 1.0f / sum;
+
+    #pragma unroll
+    for(int i = 0;i < ITEMS;i++){
+        int idx = tid + i * blockDim.x;
+        if(idx < N)
+            y[idx] = private_elm[i] * inv_sum;
+    }
+}   
+
 std::vector<double> softmax_cpu(const std::vector<float>& input,int m,int n){
     std::vector<double> ans(m * n,0);
     double tmp_max = -INFINITY;
@@ -170,11 +206,12 @@ std::vector<double> softmax_cpu(const std::vector<float>& input,int m,int n){
 }
 
 int main(){
-    const int M = 128;
-    const int N = 1024;
-    const int THREADS = 256;
+    const int M = 1024;
+    constexpr int N = 4096;
+    constexpr int THREADS = 256;
     const int WARM_UP = 100;
     const int REPEAT = 1000;
+    constexpr int ITEMS = (N + THREADS - 1) / THREADS;
     size_t bytes = M * N * sizeof(float);
     std::vector<float> h_input(M * N,0);
     std::vector<float> h_output(M * N,-1);
@@ -199,11 +236,8 @@ int main(){
 
     for(int i = 0;i < WARM_UP;i++){
         softmax_v1<<<M,THREADS,THREADS * sizeof(float)>>>(d_input,d_output,M,N);
-    }
-    CHECK_CUDA(cudaGetLastError());
-
-    for(int i = 0;i < WARM_UP;i++){
         softmax_v2<<<M,THREADS>>>(d_input,d_output,M,N);
+        softmax_v3<ITEMS><<<M,THREADS>>>(d_input,d_output,M,N);
     }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -271,9 +305,40 @@ int main(){
 
     std::cout << "V2 Unlimited: " << unlimited << std::endl;
     std::cout << "V2 Max Error: " << max_error << std::endl;
+
+    CHECK_CUDA(cudaEventRecord(start));
+    for(int i = 0;i < REPEAT;i++){
+        softmax_v3<ITEMS><<<M,THREADS>>>(d_input,d_output,M,N);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaEventElapsedTime(&ms,start,stop));
+    float avg_ms_v3 = ms / REPEAT;
+    CHECK_CUDA(cudaMemcpy(h_output.data(),d_output,bytes,cudaMemcpyDeviceToHost));
+
+    unlimited = 0;
+    max_error = 0.0f;
+    for(int i = 0;i < M * N;i++){
+        if(!std::isfinite(h_output[i])){
+            unlimited++;
+            continue;
+        }
+
+        max_error = fmax(max_error,std::abs(h_output[i] - h_reference[i]));
+    }
+
+    if(unlimited == 0 && max_error <= 1e-6)
+        std::cout << "V3 PASSED" << std::endl;
+    else
+        std::cout << "V3 FAILED" << std::endl;
+
+    std::cout << "V3 Unlimited: " << unlimited << std::endl;
+    std::cout << "V3 Max Error: " << max_error << std::endl;
     
     std::cout << "V1 Average Time: " << avg_ms_v1 << "ms" << std::endl;
     std::cout << "V2 Average Time: " << avg_ms_v2 << "ms" << std::endl;
+    std::cout << "V3 Average Time: " << avg_ms_v3 << "ms" << std::endl;
 
     CHECK_CUDA(cudaFree(d_input));
     CHECK_CUDA(cudaFree(d_output));
